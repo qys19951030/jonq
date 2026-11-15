@@ -420,3 +420,13 @@ The `--stream` CLI flag supports row-wise queries over root-array JSON. It is
 compatible with field selection, expressions, and `if` filters. It rejects
 aggregations, `group by`, `sort`, `distinct`, and `limit` because those require
 global input state.
+
+## Bounded-Memory Compatibility
+
+The `--bounded` flag runs the full query syntax (including `group by`, `sort`,
+`distinct`, and `limit`) through an engine with a memory ceiling. It supports a
+root JSON array, JSONL (`.jsonl`/`.ndjson`), and manifests of files (`--manifest`).
+Global operations spill sorted or partially aggregated chunks to temporary files
+and merge them, so `sort` keeps equal keys in input order and aggregates match a
+one-pass computation. Array-flattening paths (`from x[]`, `field[]`) are rejected
+in this mode; use the default mode for those.

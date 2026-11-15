@@ -590,6 +590,8 @@ def validate_query_against_schema(json_file: str, query) -> str | None:
 def handle_error_with_context(error, json_file=None, query=None, jq_filter=None):
     if isinstance(error, JonqError):
         print(error.format_error())
+    elif _is_streaming_error(error):
+        print(error.format_error())
     elif isinstance(error, (RuntimeError, ValueError)) and "Error in jq filter:" in str(
         error
     ):
@@ -599,3 +601,15 @@ def handle_error_with_context(error, json_file=None, query=None, jq_filter=None)
         print(jonq_error.format_error())
     else:
         print(f"Error: {error}")
+
+
+def _is_streaming_error(error) -> bool:
+    """True for errors raised by the bounded-memory engine.
+
+    Imported lazily so the legacy path never imports the streaming package.
+    """
+    try:
+        from jonq.streaming.errors import StreamingError
+    except ImportError:  # pragma: no cover - streaming package is always shipped
+        return False
+    return isinstance(error, StreamingError)

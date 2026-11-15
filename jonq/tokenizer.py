@@ -23,7 +23,8 @@ class Token:
         return f"Token({self.type}, '{self.value}')"
 
 
-def tokenize_with_lexer(query):
+def _lex_tokens(query):
+    """Lex ``query`` into :class:`Token` objects that keep char offsets."""
     token_specs = [
         ("WHITESPACE", r"\s+"),
         (
@@ -106,8 +107,20 @@ def tokenize_with_lexer(query):
     if pos < len(query) and not query[pos:].isspace():
         raise ValueError(f"Unexpected character '{query[pos]}' at position {pos}")
 
-    simple_tokens = [token.value for token in tokens]
-    return simple_tokens
+    return tokens
+
+
+def tokenize_with_positions(query):
+    """Return ``(value, position)`` pairs for ``query``.
+
+    Same tokenisation and the same ``ValueError`` messages as
+    :func:`tokenize`, but each token keeps the character offset it started at.
+    """
+    return [(token.value, token.position) for token in _lex_tokens(query)]
+
+
+def tokenize_with_lexer(query):
+    return [token.value for token in _lex_tokens(query)]
 
 
 def tokenize(query):

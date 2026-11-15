@@ -944,8 +944,93 @@ async def _follow_stdin(query: str, options: dict) -> None:
         pass
 
 
+def _run_bounded_query(
+    json_file: str,
+    query: str,
+    options: dict,
+    t_start: float,
+    t_parse: float,
+) -> str | None:
+    """Run the bounded-memory engine from the CLI.
+
+    Only ``json``, ``jsonl``, ``csv`` and ``table`` are supported here: the
+    engine writes the final rows itself so its statistics match the output.  The
+    legacy ``--limit`` still applies on top; ``yaml``/``--raw`` keep using the
+    whole-file path because they are presentation-only rewrites of a full
+    document.
+    """
+    from jonq.streaming.config import ConfigError, StreamingConfig
+    from jonq.streaming.engine import execute_streaming
+
+    if options["format"] not in ("json", "jsonl", "csv", "table"):
+        raise ValueError(
+            "--bounded supports --format json, jsonl, csv or table."
+        )
+
+    manifest = bool(options.get("manifest"))
+    source = json_file
+
+    config_kwargs = {
+        "chunk_size": options.get("chunk_size"),
+        "memory_limit": options.get("memory_limit"),
+        "float_tolerance": options.get("float_tolerance"),
+        "bad_record_policy": options.get("bad_record_policy"),
+        "temp_dir": options.get("temp_dir"),
+        "keep_temp": options.get("keep_temp", False),
+        "input_kind": "manifest" if manifest else None,
+    }
+    config = StreamingConfig.from_options(config_kwargs)
+
+    try:
+        result = execute_streaming(
+            source,
+            query,
+            output_format=options["format"],
+            config=config,
+            output_path=options.get("out"),
+            indent=options.get("pretty", False),
+            row_limit=options.get("limit"),
+        )
+    except ConfigError as exc:
+        raise ValueError(str(exc)) from exc
+
+    if options.get("show_time"):
+        _print_timing(t_start, t_parse, time.monotonic(), time.monotonic())
+
+    if options.get("stats") == "text":
+        # Statistics go to stderr so stdout stays a clean data stream.
+        sys.stderr.write(result.stats_text() + "\n")
+    elif options.get("stats") == "json":
+        sys.stderr.write(result.stats_json() + "\n")
+
+    for skipped in result.skipped_records:
+        sys.stderr.write(
+            "Skipped record at {source}:{line} ({reason})\n".format(
+                source=skipped.get("source"),
+                line=skipped.get("line"),
+                reason=skipped.get("reason"),
+            )
+        )
+
+    if options.get("out"):
+        return None
+    return result.text
+
+
 async def _run_query(json_file: str, query: str, options: dict) -> str | None:
     t_start = time.monotonic()
+
+    if options.get("bounded"):
+        # ``--jq``/``--explain`` still describe the jq-backed compilation; the
+        # actual execution is handed to the bounded engine, which parses the
+        # query itself so its diagnostics (offsets, snippets) surface here.
+        if options.get("show_jq") or options.get("explain"):
+            compiled = compile_query(query)
+            if options.get("show_jq"):
+                return compiled.jq_filter
+            return _explain_query(compiled)
+        return _run_bounded_query(json_file, query, options, t_start, t_start)
+
     compiled = compile_query(query)
     t_parse = time.monotonic()
 
@@ -1056,6 +1141,14 @@ async def _amain(argv: list[str] | None = None):
 
     options = _options_from_args(args)
 
+    if options.get("bounded") and options.get("raw_output"):
+        print(
+            "Error: --bounded does not support --raw; use --format jsonl "
+            "for one compact value per line.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     if options.get("raw_output") and options["format"] != "json":
         parser.error("--raw/--raw-output can only be used with JSON output.")
 
@@ -1099,7 +1192,58 @@ async def _amain(argv: list[str] | None = None):
         if json_file != "-" and not stdin_is_pipe:
             print("--follow requires piped stdin. Usage: ... | jonq --follow \"select ...\"", file=sys.stderr)
             sys.exit(1)
+        if options.get("bounded"):
+            print(
+                "Error: --follow streams stdin line-by-line and cannot be "
+                "combined with --bounded.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         await _follow_stdin(query, options)
+        return
+
+    if options.get("bounded"):
+        # The bounded engine reads files (and manifests) directly: no NDJSON
+        # slurping, glob concatenation or stdin temp files, all of which would
+        # defeat chunked reads.  Fail clearly on unsupported sources instead.
+        if json_file == "-":
+            print(
+                "Error: --bounded requires a readable file or --manifest; "
+                "stdin is not supported.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if "*" in json_file or "?" in json_file:
+            print(
+                "Error: --bounded does not expand globs; use --manifest FILE "
+                "listing the inputs instead.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if json_file.startswith(("http://", "https://")):
+            print(
+                "Error: --bounded does not fetch URLs; download the file first.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        try:
+            if options.get("watch"):
+                await _watch_loop(json_file, query, options)
+                return
+            result = await _run_query(json_file, query, options)
+            if result:
+                out_path = options.get("out")
+                if out_path:
+                    import re
+
+                    clean = re.sub(r"\033\[[0-9;]*m", "", result)
+                    with open(out_path, "w", encoding="utf-8") as fp:
+                        fp.write(clean + ("\n" if not clean.endswith("\n") else ""))
+                else:
+                    print(result)
+        except Exception as exc:
+            handle_error_with_context(exc, json_file, query, None)
+            sys.exit(1)
         return
 
     tmp_paths: list[str] = []
@@ -1233,6 +1377,60 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Process row-wise root-array queries in streaming mode",
     )
     parser.add_argument(
+        "--bounded",
+        "--memory-bounded",
+        dest="bounded",
+        action="store_true",
+        help=(
+            "Run with the bounded-memory engine (chunked reads, external sort, "
+            "chunked aggregation). Default keeps whole-file behaviour."
+        ),
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        metavar="N",
+        help="Records per chunk in bounded-memory mode",
+    )
+    parser.add_argument(
+        "--memory-limit",
+        metavar="SIZE",
+        help="Memory ceiling for bounded-memory mode, e.g. 64MB or 1GiB",
+    )
+    parser.add_argument(
+        "--float-tolerance",
+        type=float,
+        metavar="EPS",
+        help="Allowed relative error when comparing merged float aggregates",
+    )
+    parser.add_argument(
+        "--bad-records",
+        choices=("error", "skip"),
+        dest="bad_record_policy",
+        help="Bad-record policy for bounded-memory mode (default: error)",
+    )
+    parser.add_argument(
+        "--manifest",
+        action="store_true",
+        help="Treat the source argument as a manifest of JSON file paths",
+    )
+    parser.add_argument(
+        "--stats",
+        choices=("text", "json"),
+        dest="stats",
+        help="Print execution statistics after the result (bounded-memory mode)",
+    )
+    parser.add_argument(
+        "--temp-dir",
+        metavar="DIR",
+        help="Directory for spill files in bounded-memory mode",
+    )
+    parser.add_argument(
+        "--keep-temp",
+        action="store_true",
+        help="Keep spill files after the run (debugging bounded-memory mode)",
+    )
+    parser.add_argument(
         "--ndjson",
         action="store_true",
         help="Force NDJSON mode (auto-detected by default)",
@@ -1315,6 +1513,15 @@ def _options_from_args(args: argparse.Namespace) -> dict:
         "watch": args.watch,
         "no_color": args.no_color,
         "follow": getattr(args, "follow", False),
+        "bounded": getattr(args, "bounded", False),
+        "chunk_size": getattr(args, "chunk_size", None),
+        "memory_limit": getattr(args, "memory_limit", None),
+        "float_tolerance": getattr(args, "float_tolerance", None),
+        "bad_record_policy": getattr(args, "bad_record_policy", None),
+        "manifest": getattr(args, "manifest", None),
+        "stats": getattr(args, "stats", None),
+        "temp_dir": getattr(args, "temp_dir", None),
+        "keep_temp": getattr(args, "keep_temp", False),
     }
 
 

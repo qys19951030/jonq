@@ -3,6 +3,10 @@
 ## Unreleased
 
 ### Added
+- **Bounded-memory execution** (`--bounded`): chunked reads over root arrays, JSONL and manifests; external stable merge sort with spill files; chunk-local aggregation merged across chunks; configurable chunk size, memory ceiling, and float tolerance.
+- **Bad-record policies** (`--bad-records error|skip`) with per-line reporting and skip counts that match across JSON, CSV and table output.
+- **Execution statistics** (`--stats text|json`) covering records read/skipped/filtered, output rows, chunks, spilled bytes, peak-memory estimate, and phase timings; the same counters are exposed on `StreamingResult.stats`.
+- **Position-aware query errors** for the bounded engine: syntax errors report an offset plus snippet, and semantic errors (missing field, type mismatch) fail before any record is scanned.
 - **JSON workbench commands**: `jonq profile`, `jonq diff`, `jonq check`, and `jonq run`.
 - **`jonq.yaml` workflows** for named queries and repeatable field/type/null/count checks.
 - **Profile output** with field presence, null count, missing count, type conflicts, and sample values.

@@ -162,6 +162,43 @@ jonq large.json "select id, name if active = true" --stream
 
 It rejects global operations such as aggregation, grouping, sorting, distinct, and limit because those require the full input.
 
+## Bounded-memory mode
+
+`--bounded` (alias `--memory-bounded`) runs the same queries through an
+execution engine with a memory ceiling, so a file larger than RAM still works and
+sorting/grouping no longer require the whole result in memory.
+
+```bash
+# Chunked reads, external merge sort, spill files in a temp directory
+jonq large.json "select id, name sort name" --bounded
+
+# Group/aggregate across chunks
+jonq sales.json "select region, count(*) as n, sum(amount) as total group by region" --bounded
+
+# Read several files from a manifest (duplicates are removed and counted)
+jonq files.manifest "select * if level = 'error'" --bounded --manifest
+
+# Tune the chunk size and memory ceiling; print statistics after the result
+jonq large.json "select id sort id" --bounded --chunk-size 5000 --memory-limit 256MB --stats text
+```
+
+Supported input shapes are a root JSON array, one JSON value per line (JSONL,
+`.jsonl`/`.ndjson`), and a manifest listing multiple files. Bad records can be
+reported and skipped instead of aborting:
+
+```bash
+jonq events.jsonl "select level, msg" --bounded --bad-records skip --stats json
+```
+
+Statistics (records read/skipped/filtered, output rows, chunks, spilled bytes,
+peak-memory estimate, elapsed time) go to stderr with `--stats text|json`, and
+the same counters are available as `result.stats` in the API. Every temporary
+spill file is removed on completion, error, or interruption (`--keep-temp`
+keeps them for debugging).
+
+The default (no `--bounded`) behaviour is unchanged: the query is compiled to jq
+and executed over the whole document, so the two modes can be compared directly.
+
 ## Debugging Queries
 
 ```bash
